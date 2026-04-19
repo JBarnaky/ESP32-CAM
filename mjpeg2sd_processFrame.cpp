@@ -227,9 +227,12 @@ static bool processFrame() {
 
     // State machine to handle lifecycle events (motion/capture start/stop)
     static enum {
-        STATE_NORMAL, STATE_MOTION_START, STATE_MOTION_END,
-        STATE_CAPTURE_START, STATE_CAPTURE_END
-    } frameState = STATE_NORMAL;
+        MOTION_NORMAL, MOTION_START, MOTION_END
+    } motionState = MOTION_NORMAL;
+
+    static enum {
+        CAPTURE_NORMAL, CAPTURE_START, CAPTURE_END
+    } captureState = CAPTURE_NORMAL;
 
     // Record start time to measure processing duration
     const uint32_t frameStart = millis();
@@ -238,9 +241,7 @@ static bool processFrame() {
     camera_fb_t* fb = esp_camera_fb_get();
 
     // Safety check: Exit if memory allocation failed
-    if (fb == nullptr) {
-        return false;
-    }
+    if (fb == nullptr) return false;
 
     // Validate frame size; release buffer immediately if invalid to prevent leaks
     if (fb->len == 0 || fb->len > maxFrameBuffSize) {
@@ -290,29 +291,31 @@ static bool processFrame() {
         haveMotion = (reasonId != 0);
     }
 
-    // Default state is normal; update only if transitions occur
-    frameState = STATE_NORMAL;
+    // Reset states for this frame
+    motionState = MOTION_NORMAL;
+    captureState = CAPTURE_NORMAL;
 
-    // Detect transition between motion and no-motion states
+    // Detect motion state transition
     if (haveMotion != prevMotion) {
-        frameState = haveMotion ? STATE_MOTION_START : STATE_MOTION_END;
+        motionState = haveMotion ? MOTION_START : MOTION_END;
     }
 
-    // Detect transition between recording and idle states
-    if (isCapturing != (haveMotion || forceRecord)) {
-        frameState = (haveMotion || forceRecord) ? STATE_CAPTURE_START : STATE_CAPTURE_END;
+    // Detect capture state transition (no longer overwrites motion state)
+    const bool shouldCapture = haveMotion || forceRecord;
+    if (isCapturing != shouldCapture) {
+        captureState = shouldCapture ? CAPTURE_START : CAPTURE_END;
     }
 
-    // Handle actions triggered specifically by the start or end of motion
-    switch (frameState) {
-    case STATE_MOTION_START:
-        keepFrame(fb); // Save the first frame where motion was detected
+    // Handle MOTION lifecycle events (guaranteed to execute)
+    switch (motionState) {
+    case MOTION_START:
+        keepFrame(fb);  // Save trigger frame
 #if INCLUDE_PERIPH
-        buzzerAlert(true); // Activate alarm
+        buzzerAlert(true);
         if (lampAuto && nightTime) setLamp(lampLevel); // Turn on light if dark
 #endif
         break;
-    case STATE_MOTION_END:
+    case MOTION_END:
 #if INCLUDE_PERIPH
         if (lampAuto) setLamp(0); // Turn off light
         buzzerAlert(false); // Deactivate alarm
@@ -323,21 +326,18 @@ static bool processFrame() {
     }
 
     const bool prevCapture = isCapturing;
-    // Update recording state: active if motion detected or forced manually
-    isCapturing = haveMotion || forceRecord;
+    isCapturing = haveMotion || forceRecord;  // Update after state detection
 
-    // Handle actions triggered specifically by the start or stop of recording
-    switch (frameState) {
-    case STATE_CAPTURE_START:
+    // Handle CAPTURE lifecycle events (independent of motion state)
+    switch (captureState) {
+    case CAPTURE_START:
         stopPlaying(); // Halt any ongoing playback to free resources
         stopPlayback = true;
-        // Log the source that triggered the recording
         if (!dashCamOn) LOG_ALT("Capture started by %s%s%s%s",
             reasonId == 0 ? "Button" : "", reasonId == 1 ? "Camera " : "",
             reasonId == 2 ? "PIR" : "", reasonId == 3 ? "Accelerometer" : "");
 #if INCLUDE_MQTT
         if (mqtt_active) {
-            // Notify remote systems via MQTT that recording has begun
             snprintf(jsonBuff, sizeof(jsonBuff), "{\"RECORD\":\"ON\", \"TIME\":\"%s\"}",
                 esp_log_system_timestamp());
             mqttPublish(jsonBuff);
@@ -370,7 +370,6 @@ static bool processFrame() {
             }
         }
 #if INCLUDE_PERIPH
-        // Turn off buzzer after configured duration expires
         if (buzzerUse && frameCnt >= buzzerDuration * FPS) buzzerAlert(false);
 #endif
     }
@@ -379,10 +378,10 @@ static bool processFrame() {
     esp_camera_fb_return(fb);
 
     // Finalize recording if capture just ended
-    if (frameState == STATE_CAPTURE_END) {
+    if (captureState == CAPTURE_END) {
         closeAvi();      // Finalize AVI file header and close
         wsAsyncSendJson("ustatus", "\"showRecord\":0"); // Update UI status
-        stopPlayback = false; // Allow playback again
+        stopPlayback = false;
     }
 
     return true;
